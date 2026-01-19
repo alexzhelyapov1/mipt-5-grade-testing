@@ -12,17 +12,25 @@
 #include <cstring>
 
 static uint8_t* global_coverage_map_ptr = nullptr; // Per-execution coverage map
-static bool* permanent_seen_coverage_ptr = nullptr; // Tracks all unique blocks ever seen
+static uint8_t* permanent_seen_coverage_ptr = nullptr; // Tracks hit count buckets for each block
 static uint32_t *__start_pc_guard;
 static uint32_t *__stop_pc_guard;
 static size_t num_guards;
 
-// Current input buffer being fuzzed, used by the crash handler
-static std::vector<uint8_t> current_input_buffer;
-
 static std::vector<std::vector<uint8_t>> corpus;
 
+// Input Buffers
+const size_t MAX_INPUT_SIZE = 1 * 1024 * 1024; // 1MB
+static uint8_t input_buffer[MAX_INPUT_SIZE];
+static size_t input_size = 0;
+static uint8_t scratch_buffer[MAX_INPUT_SIZE];
+
 static std::mt19937_64 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+
+static const uint8_t INTERESTING_VALUES[] = {
+    0x00, 0xFF, 0x7F, 0x01, 0x10, 0x80, 0xFE, 0x7E
+    // 0x00, 0xFF, 0x7F, 0x01, 0x10, 0x80, 0xFE, 0x7E, 'H', 'I', '!'
+};
 
 extern "C" {
     void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
@@ -34,10 +42,10 @@ extern "C" {
         num_guards = stop - start;
         fprintf(stderr, "INFO: __sanitizer_cov_trace_pc_guard_init: guards: %lu\n", num_guards);
         global_coverage_map_ptr = new uint8_t[num_guards];
-        permanent_seen_coverage_ptr = new bool[num_guards];
+        permanent_seen_coverage_ptr = new uint8_t[num_guards];
         for (size_t i = 0; i < num_guards; ++i) {
             global_coverage_map_ptr[i] = 0;
-            permanent_seen_coverage_ptr[i] = false;
+            permanent_seen_coverage_ptr[i] = 0;
         }
     }
 
@@ -49,97 +57,122 @@ extern "C" {
     }
 }
 
+uint8_t get_bucket(uint8_t hit_count) {
+    if (hit_count == 0)
+        return 0;
+    if (hit_count == 1)
+        return 1;
+    if (hit_count == 2)
+        return 2;
+    if (hit_count == 3)
+        return 3;
+    if (hit_count < 8)
+        return 4;
+    if (hit_count < 16)
+        return 5;
+    if (hit_count < 32)
+        return 6;
+    if (hit_count < 128)
+        return 7;
+    return 8;
+}
+
 void reset_coverage_map() {
     memset(global_coverage_map_ptr, 0, num_guards * sizeof(uint8_t));
 }
 
-std::vector<uint8_t> mutate_bit_flip(const std::vector<uint8_t>& input) {
-    std::vector<uint8_t> mutated_input = input;
-    if (mutated_input.empty()) return mutated_input;
-    std::uniform_int_distribution<size_t> dist(0, mutated_input.size() - 1);
+size_t mutate_bit_flip(uint8_t *data, size_t size) {
+    if (size == 0) return 0;
+    std::uniform_int_distribution<size_t> dist(0, size - 1);
     size_t idx = dist(rng);
-    mutated_input[idx] ^= (1 << (rng() % 8)); // Flip bit
-    return mutated_input;
+    data[idx] ^= (1 << (rng() % 8)); // Flip bit
+    return size;
 }
 
-std::vector<uint8_t> mutate_byte_flip(const std::vector<uint8_t>& input) {
-    std::vector<uint8_t> mutated_input = input;
-    if (mutated_input.empty()) return mutated_input;
-    std::uniform_int_distribution<size_t> dist(0, mutated_input.size() - 1);
+size_t mutate_byte_flip(uint8_t *data, size_t size) {
+    if (size == 0) return 0;
+    std::uniform_int_distribution<size_t> dist(0, size - 1);
     size_t idx = dist(rng);
 
     if (rng() % 2 == 0) {
-        mutated_input[idx] = ~mutated_input[idx]; // Invert byte
+        data[idx] = ~data[idx]; // Invert byte
     } else {
         // replacing with interesting value
-        const uint8_t interesting_values[] = {0x00, 0xFF, 0x7F, 0x01, 0x10, 0x80, 'H', 'I', '!'};
-        mutated_input[idx] = interesting_values[rng() % (sizeof(interesting_values) / sizeof(interesting_values[0]))];
+        data[idx] = INTERESTING_VALUES[rng() % (sizeof(INTERESTING_VALUES) / sizeof(INTERESTING_VALUES[0]))];
     }
-    return mutated_input;
+    return size;
 }
 
-std::vector<uint8_t> mutate_arithmetic(const std::vector<uint8_t>& input) {
-    std::vector<uint8_t> mutated_input = input;
-    if (mutated_input.empty()) return mutated_input;
-    std::uniform_int_distribution<size_t> dist(0, mutated_input.size() - 1);
+size_t mutate_arithmetic(uint8_t *data, size_t size) {
+    if (size == 0) return 0;
+    std::uniform_int_distribution<size_t> dist(0, size - 1);
     size_t idx = dist(rng);
     int8_t delta = (rng() % 3) - 1;
-    mutated_input[idx] += delta;
-    return mutated_input;
+    data[idx] += delta;
+    return size;
 }
 
-std::vector<uint8_t> mutate_insert_interesting_byte(const std::vector<uint8_t>& input) {
-    std::vector<uint8_t> mutated_input = input;
-    const uint8_t interesting_values[] = {0x00, 0xFF, 0x7F, 0x01, 0x10, 0x80, 'H', 'I', '!'};
-    uint8_t byte_to_insert = interesting_values[rng() % (sizeof(interesting_values) / sizeof(interesting_values[0]))];
+size_t mutate_insert_interesting_byte(uint8_t *data, size_t size) {
+    if (size >= MAX_INPUT_SIZE) return size;
 
-    std::uniform_int_distribution<size_t> dist(0, mutated_input.size());
+    uint8_t byte_to_insert = INTERESTING_VALUES[rng() % (sizeof(INTERESTING_VALUES) / sizeof(INTERESTING_VALUES[0]))];
+
+    std::uniform_int_distribution<size_t> dist(0, size);
     size_t idx = dist(rng);
 
-    mutated_input.insert(mutated_input.begin() + idx, byte_to_insert);
-    return mutated_input;
+    memmove(data + idx + 1, data + idx, size - idx);
+    data[idx] = byte_to_insert;
+
+    return size + 1;
 }
 
-std::vector<uint8_t> mutate_splicing(const std::vector<uint8_t>& input1, const std::vector<uint8_t>& input2) {
-    if (input1.empty() || input2.empty()) {
-        return input1.empty() ? input2 : input1;
-    }
+size_t mutate_splicing(uint8_t *data, size_t size, const std::vector<uint8_t>& other_input) {
+    if (other_input.empty()) return size;
 
-    std::uniform_int_distribution<size_t> dist1(0, input1.size());
+    std::uniform_int_distribution<size_t> dist1(0, size);
     size_t split_point = dist1(rng);
 
-    std::vector<uint8_t> new_input;
-    new_input.insert(new_input.end(), input1.begin(), input1.begin() + split_point);
+    memcpy(scratch_buffer, data, split_point);
 
-    std::uniform_int_distribution<size_t> dist2(0, input2.size());
+    std::uniform_int_distribution<size_t> dist2(0, other_input.size());
     size_t start_point2 = dist2(rng);
 
-    new_input.insert(new_input.end(), input2.begin() + start_point2, input2.end());
-
-    return new_input;
-}
-
-std::vector<uint8_t> mutate(const std::vector<uint8_t>& input, const std::vector<uint8_t>* other_input = nullptr) {
-    if (other_input && !other_input->empty() && (rng() % 4 == 0)) { // 25% chance of splicing
-        return mutate_splicing(input, *other_input);
+    size_t other_size = other_input.size() - start_point2;
+    if (split_point + other_size > MAX_INPUT_SIZE) {
+        other_size = MAX_INPUT_SIZE - split_point;
     }
 
-    if (input.empty()) {
-        std::vector<uint8_t> initial_input;
-        initial_input.resize(1 + (rng() % 10), rng() % 256); // Start with random bytes
-        return initial_input;
+    memcpy(scratch_buffer + split_point, other_input.data() + start_point2, other_size);
+
+    size_t new_size = split_point + other_size;
+    memcpy(data, scratch_buffer, new_size);
+
+    return new_size;
+}
+
+size_t mutate(uint8_t *data, size_t size, const std::vector<uint8_t>* other_input = nullptr) {
+    if (other_input && !other_input->empty() && (rng() % 4 == 0)) { // 25% chance of splicing
+        return mutate_splicing(data, size, *other_input);
+    }
+
+    if (size == 0) {
+        size_t new_size = 1 + (rng() % 10);
+        for (size_t i = 0; i < new_size; ++i) {
+            data[i] = rng() % 256;
+        }
+        return new_size;
     }
 
     switch (rng() % 4) {
         case 0:
-            return mutate_bit_flip(input);
+            return mutate_bit_flip(data, size);
         case 1:
-            return mutate_byte_flip(input);
+            return mutate_byte_flip(data, size);
         case 2:
-            return mutate_arithmetic(input);
+            return mutate_arithmetic(data, size);
         case 3:
-            return mutate_insert_interesting_byte(input);
-        default: return input;
+            return mutate_insert_interesting_byte(data, size);
+        default: return size;
     }
 }
 
@@ -149,7 +182,7 @@ void crash_handler(int sig) {
     snprintf(filename, sizeof(filename), "crash_%lu_%d.bin", rng(), getpid());
     std::ofstream ofs(filename, std::ios::binary);
     if (ofs) {
-        ofs.write(reinterpret_cast<const char*>(current_input_buffer.data()), current_input_buffer.size());
+        ofs.write(reinterpret_cast<const char*>(input_buffer), input_size);
         ofs.close();
         fprintf(stderr, "CRASH: Input saved to %s\n", filename);
     } else {
@@ -181,25 +214,29 @@ int main() {
         const std::vector<uint8_t>& seed = corpus[corpus_dist(rng)];
         const std::vector<uint8_t>& other_seed = corpus[corpus_dist(rng)];
 
-        std::vector<uint8_t> test_input = mutate(seed, &other_seed);
-        current_input_buffer = test_input;
+        memcpy(input_buffer, seed.data(), seed.size());
+        input_size = seed.size();
+
+        input_size = mutate(input_buffer, input_size, &other_seed);
 
         reset_coverage_map();
 
-        LLVMFuzzerTestOneInput(test_input.data(), test_input.size());
+        LLVMFuzzerTestOneInput(input_buffer, input_size);
         executions++;
 
         bool discovered_new_block = false;
         for (size_t i = 0; i < num_guards; ++i) {
-            if (global_coverage_map_ptr[i] > 0 && !permanent_seen_coverage_ptr[i]) {
-                permanent_seen_coverage_ptr[i] = true;
+            uint8_t bucket = get_bucket(global_coverage_map_ptr[i]);
+            if (bucket > permanent_seen_coverage_ptr[i]) {
+                permanent_seen_coverage_ptr[i] = bucket;
                 discovered_new_block = true;
             }
         }
 
         if (discovered_new_block) {
-            corpus.push_back(test_input);
-            fprintf(stderr, "INFO: New path found. Corpus size: %lu\n", corpus.size());
+            corpus.push_back(std::vector<uint8_t>(input_buffer, input_buffer + input_size));
+            printf("INFO: New path found. Corpus size: %lu, input: '%.*s'\n", corpus.size(), (int)input_size,
+                input_buffer);
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
